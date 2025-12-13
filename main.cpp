@@ -271,12 +271,15 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD type)
         case CTRL_SHUTDOWN_EVENT:
         case CTRL_LOGOFF_EVENT:
         {
-            if (gMainHwnd){
+            if (gMainHwnd)
+            {
                 PostMessageW(gMainHwnd, WM_CLOSE, 0, 0);
                 return TRUE;
             }
 
-            break;
+            // Если окна ещё нет (очень ранний Stop) — просто скажем “обработали”.
+            // Дальше CLion обычно добьёт процесс сам, но главное — не зависать.
+            return TRUE;
         }
         default: /* nothing */;
     }
@@ -286,15 +289,28 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD type)
 
 static void SetupDebugStopHelper()
 {
-#if !defined(NDEBUG)
-	// Для Debug: позволяем "мягкому" Stop закрывать приложение.
-	// Сначала пробуем прицепиться к консоли родителя, если нет - создаём свою.
-	if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-		AllocConsole();
-	}
+    // Важно: НЕ AllocConsole(), иначе CLion Stop часто не попадает в наш процесс.
+    // 1) Если консоль уже есть — просто ставим handler.
+    // 2) Если нет — пробуем AttachConsole к родителю (если запуск был из консоли/IDE-терминала).
+    // 3) Если не получилось — просто ничего (в GUI-режиме Ctrl-событий всё равно не будет).
 
-	SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
-#endif
+    bool hasConsole = (GetConsoleWindow() != nullptr);
+
+    if (!hasConsole)
+    {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            hasConsole = true;
+        } else {
+            // ERROR_ACCESS_DENIED бывает, если консоль уже есть (AttachConsole не нужен).
+            if (GetLastError() == ERROR_ACCESS_DENIED) {
+                hasConsole = true;
+            }
+        }
+    }
+
+    if (hasConsole) {
+        SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
+    }
 }
 
 //=====================================================================//
