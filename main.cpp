@@ -1,3 +1,4 @@
+// main.cpp
 // ReSharper disable CppParameterMayBeConst
 // ReSharper disable CppLocalVariableMayBeConst
 // ReSharper disable CppParameterMayBeConstPtrOrRef
@@ -9,6 +10,7 @@
  * - Категории (Ctrl+1 / Ctrl+2 / Ctrl+3) через GetAsyncKeyState (без RegisterHotKey)
  * - По комбо: Ctrl+A -> Ctrl+C -> читаем clipboard -> считаем -> округляем вверх до 10 -> пишем clipboard -> Ctrl+V
  * - Настройки коэффициентов через окно "Настройки" из меню трея, сохраняются в settings.ini (в каталоге запуска)
+ * - Автозапуск через реестр (HKLM\...\Run) с запросом повышения прав только по нажатию пунктов меню
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -17,6 +19,7 @@
 #include <commctrl.h>
 
 #include <string>
+#include <cwctype>
 #include <cwchar>
 #include <cmath>
 #include <cstring>
@@ -29,14 +32,16 @@
 static constexpr UINT  kTrayCallbackMsg = WM_APP + 1;
 
 // IDs меню
-static constexpr UINT  kMenuSettings = 1002;
-static constexpr UINT  kMenuExit     = 1001;
+static constexpr UINT  kMenuSettings      = 1002;
+static constexpr UINT  kMenuAutorunEnable = 1003;
+static constexpr UINT  kMenuAutorunDisable = 1004;
+static constexpr UINT  kMenuExit          = 1001;
 
 // ID иконки из ресурсов (main.rc: `1 ICON ...`)
 static constexpr int   kAppIconId    = 1;
 
 // Коэффициенты по умолчанию (потом подхватятся из ini)
-static double gCoeffs[3] = { 1.75, 1.6, 2.0 };
+static double gCoeffs[3] = { 1.6, 1.75, 2.0 };
 
 static HICON gIconBig   = nullptr;
 static HICON gIconSmall = nullptr;
@@ -44,6 +49,185 @@ static HICON gIconSmall = nullptr;
 static UINT  gTaskbarCreatedMsg = 0;
 
 static HWND  gMainHwnd = nullptr;
+
+//=====================================================================//
+// Autorun (HKLM\Software\Microsoft\Windows\CurrentVersion\Run)
+//=====================================================================//
+
+static const wchar_t *kAutorunRegPath  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t *kAutorunValueName = L"TrayHotkeyCalc";
+
+static std::wstring GetExePath()
+{
+	wchar_t buf[4096] = {};
+	const DWORD got = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(_countof(buf)));
+	if (got == 0 || got >= _countof(buf)) {
+		return L"";
+	}
+	return std::wstring(buf);
+}
+
+static std::wstring QuotePath(const std::wstring &path)
+{
+	std::wstring out;
+	out.reserve(path.size() + 2);
+	out.push_back(L'"');
+	out += path;
+	out.push_back(L'"');
+	return out;
+}
+
+static LONG Autorun_Enable_HKLM()
+{
+	const std::wstring exe = GetExePath();
+	if (exe.empty()) return ERROR_FILE_NOT_FOUND;
+
+	const std::wstring data = QuotePath(exe);
+
+	HKEY hKey = nullptr;
+	DWORD disp = 0;
+
+	LONG st = RegCreateKeyExW(
+		HKEY_LOCAL_MACHINE,
+		kAutorunRegPath,
+		0,
+		nullptr,
+		REG_OPTION_NON_VOLATILE,
+		KEY_SET_VALUE,
+		nullptr,
+		&hKey,
+		&disp
+	);
+
+	if (st != ERROR_SUCCESS) {
+		return st;
+	}
+
+	st = RegSetValueExW(
+		hKey,
+		kAutorunValueName,
+		0,
+		REG_SZ,
+		reinterpret_cast<const BYTE *>(data.c_str()),
+		static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t))
+	);
+
+	RegCloseKey(hKey);
+	return st;
+}
+
+static LONG Autorun_Disable_HKLM()
+{
+	HKEY hKey = nullptr;
+
+	LONG st = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE,
+		kAutorunRegPath,
+		0,
+		KEY_SET_VALUE,
+		&hKey
+	);
+
+	if (st == ERROR_FILE_NOT_FOUND) {
+		return ERROR_SUCCESS;
+	}
+
+	if (st != ERROR_SUCCESS) {
+		return st;
+	}
+
+	st = RegDeleteValueW(hKey, kAutorunValueName);
+	if (st == ERROR_FILE_NOT_FOUND) {
+		st = ERROR_SUCCESS;
+	}
+
+	RegCloseKey(hKey);
+	return st;
+}
+
+static bool Autorun_RunElevatedAndWait(bool enable)
+{
+	const std::wstring exe = GetExePath();
+	if (exe.empty()) return false;
+
+	const wchar_t *params = enable ? L"--autorun-enable" : L"--autorun-disable";
+
+	SHELLEXECUTEINFOW sei = {};
+	sei.cbSize = sizeof(sei);
+	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+	sei.hwnd = nullptr;
+	sei.lpVerb = L"runas";
+	sei.lpFile = exe.c_str();
+	sei.lpParameters = params;
+	sei.nShow = SW_SHOWNORMAL;
+
+	if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+		return false;
+	}
+
+	WaitForSingleObject(sei.hProcess, INFINITE);
+
+	DWORD exitCode = 1;
+	GetExitCodeProcess(sei.hProcess, &exitCode);
+
+	CloseHandle(sei.hProcess);
+	return exitCode == 0;
+}
+
+static bool Autorun_TryEnableWithElevationIfNeeded()
+{
+	const LONG st = Autorun_Enable_HKLM();
+	if (st == ERROR_SUCCESS) return true;
+
+	if (st == ERROR_ACCESS_DENIED) {
+		return Autorun_RunElevatedAndWait(true);
+	}
+
+	return false;
+}
+
+static bool Autorun_TryDisableWithElevationIfNeeded()
+{
+	const LONG st = Autorun_Disable_HKLM();
+	if (st == ERROR_SUCCESS) return true;
+
+	if (st == ERROR_ACCESS_DENIED) {
+		return Autorun_RunElevatedAndWait(false);
+	}
+
+	return false;
+}
+
+static int Autorun_TryHandleCommandLine()
+{
+	int argc = 0;
+	LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	if (!argv) {
+		return -1;
+	}
+
+	bool doEnable = false;
+	bool doDisable = false;
+
+	for (int i = 1; i < argc; i++)
+	{
+		if (wcscmp(argv[i], L"--autorun-enable") == 0) {
+			doEnable = true;
+		}
+		else if (wcscmp(argv[i], L"--autorun-disable") == 0) {
+			doDisable = true;
+		}
+	}
+
+	LocalFree(argv);
+
+	if (!doEnable && !doDisable) {
+		return -1;
+	}
+
+	const LONG st = doEnable ? Autorun_Enable_HKLM() : Autorun_Disable_HKLM();
+	return (st == ERROR_SUCCESS) ? 0 : 1;
+}
 
 //=====================================================================//
 // Single instance (без семафора, чтобы не “залипало” после TerminateProcess)
@@ -79,25 +263,25 @@ static void ReleaseSingleInstance()
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD type)
 {
-	switch (type)
-	{
-		case CTRL_C_EVENT:
-		case CTRL_BREAK_EVENT:
-		case CTRL_CLOSE_EVENT:
-		case CTRL_SHUTDOWN_EVENT:
-		case CTRL_LOGOFF_EVENT:
-		{
-			if (gMainHwnd)
-			{
-				PostMessageW(gMainHwnd, WM_CLOSE, 0, 0);
-				return TRUE;
-			}
-			break;
-		}
-		default: /* nothing */;
-	}
+    switch (type)
+    {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        {
+            if (gMainHwnd){
+                PostMessageW(gMainHwnd, WM_CLOSE, 0, 0);
+                return TRUE;
+            }
 
-	return FALSE;
+            break;
+        }
+        default: /* nothing */;
+    }
+
+    return FALSE;
 }
 
 static void SetupDebugStopHelper()
@@ -298,12 +482,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 			LoadSettings();
 
-			TrayIcon_Init(tray, hwnd, kTrayCallbackMsg, gIconSmall, L"TrayHotkeyCalc (Ctrl+1/2/3)", kMenuSettings, kMenuExit);
-			TrayIcon_Add(tray);
-
-			// HotkeyCalc: один таймер (GetAsyncKeyState)
 			HotkeyCalc_Init(hotkey);
 			HotkeyCalc_Start(hwnd);
+
+			TrayIcon_Init(tray, hwnd, kTrayCallbackMsg, gIconSmall,
+				L"TrayHotkeyCalc (Ctrl+1/2/3)",
+				kMenuSettings,
+				kMenuAutorunEnable, kMenuAutorunDisable,
+				kMenuExit);
+
+			TrayIcon_Add(tray);
 
 			return 0;
 		}
@@ -327,6 +515,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 			if (id == kMenuSettings) {
 				OpenSettings(hwnd, hInst);
+				return 0;
+			}
+
+			if (id == kMenuAutorunEnable)
+			{
+				if (Autorun_TryEnableWithElevationIfNeeded()) {
+					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Включено.");
+				} else {
+					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Не удалось включить автозапуск.");
+				}
+				return 0;
+			}
+
+			if (id == kMenuAutorunDisable)
+			{
+				if (Autorun_TryDisableWithElevationIfNeeded()) {
+					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Отключено.");
+				} else {
+					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Не удалось отключить автозапуск.");
+				}
 				return 0;
 			}
 
@@ -384,6 +592,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			PostQuitMessage(0);
 			return 0;
 		}
+
 		default: /* nothing */;
 	}
 
@@ -392,6 +601,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
+	const int autorunRc = Autorun_TryHandleCommandLine();
+	if (autorunRc >= 0) {
+		return autorunRc;
+	}
+
 	if (!EnsureSingleInstance()) return 0;
 
 	SetupDebugStopHelper();

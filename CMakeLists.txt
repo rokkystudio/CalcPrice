@@ -4,8 +4,10 @@ project(CalcPrice LANGUAGES CXX)
 add_executable(CalcPrice WIN32
     main.cpp
     main.rc
+    Autorun.h
     TrayIcon.h
     HotkeyCalc.h
+    SettingsWindow.h
 )
 
 target_compile_features(CalcPrice PRIVATE cxx_std_17)
@@ -19,4 +21,7 @@ target_link_libraries(CalcPrice PRIVATE
 
 if (MINGW)
     target_link_options(CalcPrice PRIVATE -municode)
+
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
 endif()

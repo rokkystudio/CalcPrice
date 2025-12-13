@@ -1,6 +1,7 @@
 // ReSharper disable CppDFAConstantParameter
 // ReSharper disable CppParameterMayBeConst
 // ReSharper disable CppLocalVariableMayBeConst
+// ReSharper disable CppTooWideScopeInitStatement
 
 #pragma once
 
@@ -276,7 +277,7 @@ static LRESULT CALLBACK SettingsWindow_WndProc(HWND hwnd, UINT msg, WPARAM wPara
 
 				HWND e1 = GetDlgItem(hwnd, IDC_EDIT1);
 				HWND e2 = GetDlgItem(hwnd, IDC_EDIT2);
-				HWND e3 = GetDlgItem(hwnd, IDC_EDIT3);
+                HWND e3 = GetDlgItem(hwnd, IDC_EDIT3);
 
 				if (!SettingsWindow_GetEditDouble(e1, c1) || c1 <= 0.0 ||
 					!SettingsWindow_GetEditDouble(e2, c2) || c2 <= 0.0 ||

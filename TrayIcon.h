@@ -27,6 +27,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 
 /**
  * Идентификатор иконки в трее (uID).
@@ -40,7 +41,9 @@ static constexpr UINT kTrayIconId = 1;
  * Нужен для удаления “хвостов” (висячих иконок) при следующем запуске приложения через NIM_DELETE.
  */
 static constexpr GUID kTrayIconGuid = {
-	0x5b2f7df3, 0x6f0a, 0x4c6b, { 0x9f, 0x1e, 0x6a, 0x2b, 0x4f, 0xc1, 0x12, 0x90 }
+	0x5b2f7df3, 0x6f0a, 0x4c6b, {
+	    0x9f, 0x1e, 0x6a, 0x2b, 0x4f, 0xc1, 0x12, 0x90
+	}
 };
 
 /**
@@ -124,11 +127,42 @@ static void TrayIcon_Init(TrayIcon &t, HWND hwnd, UINT callbackMsg, HICON icon, 
  */
 static void TrayIcon_Add(TrayIcon &t)
 {
+	if (!t.nid.hWnd) return;
+
 	// Удаляем “старую” запись по GUID (на случай прошлой аварийной остановки)
-	Shell_NotifyIconW(NIM_DELETE, &t.nid);
+	{
+		NOTIFYICONDATAW del = {};
+		del.cbSize = sizeof(del);
+		del.uFlags = NIF_GUID;
+		del.guidItem = kTrayIconGuid;
+		Shell_NotifyIconW(NIM_DELETE, &del);
+	}
+
+	// На всякий случай добиваем по hWnd+uID (если GUID режим где-то не сработал)
+	{
+		NOTIFYICONDATAW del2 = {};
+		del2.cbSize = sizeof(del2);
+		del2.hWnd = t.nid.hWnd;
+		del2.uID = t.nid.uID;
+		Shell_NotifyIconW(NIM_DELETE, &del2);
+	}
 
 	// “Классический” режим: без NIM_SETVERSION/NOTIFYICON_VERSION_4
-	Shell_NotifyIconW(NIM_ADD, &t.nid);
+	if (Shell_NotifyIconW(NIM_ADD, &t.nid)) {
+		return;
+	}
+
+	// Иногда Shell считает запись существующей — пробуем MODIFY
+	if (Shell_NotifyIconW(NIM_MODIFY, &t.nid)) {
+		return;
+	}
+
+	// Fallback: без GUID (по hWnd+uID), чтобы иконка точно появилась
+	NOTIFYICONDATAW fb = t.nid;
+	fb.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+
+	Shell_NotifyIconW(NIM_ADD, &fb);
+	Shell_NotifyIconW(NIM_MODIFY, &fb);
 }
 
 /**
@@ -171,6 +205,10 @@ static void TrayIcon_Remove(TrayIcon &t)
 /**
  * Показывает balloon-уведомление от иконки в трее.
  *
+ * @details
+ * Сначала пробуем по GUID. Если иконка была добавлена fallback-режимом без GUID,
+ * то делаем вторую попытку по (hWnd + uID).
+ *
  * @param t     Состояние трея.
  * @param title Заголовок (может быть nullptr).
  * @param text  Текст (может быть nullptr).
@@ -179,28 +217,54 @@ static void TrayIcon_ShowBalloon(const TrayIcon &t, const wchar_t *title, const 
 {
 	if (!t.nid.hWnd) return;
 
-	NOTIFYICONDATAW tmp = {};
-	tmp.cbSize = sizeof(tmp);
+	// 1) Попытка по GUID
+	{
+		NOTIFYICONDATAW tmp = {};
+		tmp.cbSize = sizeof(tmp);
 
-	// При NIF_GUID модификацию делаем по GUID (так надёжнее)
-	tmp.uFlags = NIF_INFO | NIF_GUID;
-	tmp.guidItem = kTrayIconGuid;
+		tmp.uFlags = NIF_INFO | NIF_GUID;
+		tmp.guidItem = kTrayIconGuid;
 
-	// На всякий случай оставим и hWnd/uID
-	tmp.hWnd = t.nid.hWnd;
-	tmp.uID = t.nid.uID;
+		// На всякий случай оставим и hWnd/uID
+		tmp.hWnd = t.nid.hWnd;
+		tmp.uID = t.nid.uID;
 
-	if (title) {
-		wcsncpy_s(tmp.szInfoTitle, title, _TRUNCATE);
+		if (title) {
+			wcsncpy_s(tmp.szInfoTitle, title, _TRUNCATE);
+		}
+
+		if (text) {
+			wcsncpy_s(tmp.szInfo, text, _TRUNCATE);
+		}
+
+		tmp.dwInfoFlags = NIIF_INFO;
+
+		if (Shell_NotifyIconW(NIM_MODIFY, &tmp)) {
+			return;
+		}
 	}
 
-	if (text) {
-		wcsncpy_s(tmp.szInfo, text, _TRUNCATE);
+	// 2) Fallback: по hWnd+uID (если иконка добавлена без GUID)
+	{
+		NOTIFYICONDATAW tmp2 = {};
+		tmp2.cbSize = sizeof(tmp2);
+
+		tmp2.uFlags = NIF_INFO;
+		tmp2.hWnd = t.nid.hWnd;
+		tmp2.uID = t.nid.uID;
+
+		if (title) {
+			wcsncpy_s(tmp2.szInfoTitle, title, _TRUNCATE);
+		}
+
+		if (text) {
+			wcsncpy_s(tmp2.szInfo, text, _TRUNCATE);
+		}
+
+		tmp2.dwInfoFlags = NIIF_INFO;
+
+		Shell_NotifyIconW(NIM_MODIFY, &tmp2);
 	}
-
-	tmp.dwInfoFlags = NIIF_INFO;
-
-	Shell_NotifyIconW(NIM_MODIFY, &tmp);
 }
 
 /**
@@ -229,7 +293,16 @@ static void TrayIcon_ShowContextMenu(const TrayIcon &t, HWND hwnd, POINT pt)
 	AppendMenuW(menu, MF_STRING, t.menuExit, L"Выход");
 
 	SetForegroundWindow(hwnd);
-	TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+
+	const UINT cmd = TrackPopupMenu(
+		menu,
+		TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD,
+		pt.x, pt.y, 0, hwnd, nullptr
+	);
+
+	if (cmd != 0) {
+		PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+	}
 
 	PostMessageW(hwnd, WM_NULL, 0, 0);
 
