@@ -5,12 +5,19 @@
 // ReSharper disable CppTooWideScopeInitStatement
 
 /**
- * TrayHotkeyCalc
+ * @file main.cpp
+ * Главный модуль PriceCalc (WinAPI, без видимого окна).
+ *
+ * @details
+ * PriceCalc:
  * - Живёт в системном трее (без видимого окна)
  * - Категории (Ctrl+1 / Ctrl+2 / Ctrl+3) через GetAsyncKeyState (без RegisterHotKey)
  * - По комбо: Ctrl+A -> Ctrl+C -> читаем clipboard -> считаем -> округляем вверх до 10 -> пишем clipboard -> Ctrl+V
  * - Настройки коэффициентов через окно "Настройки" из меню трея, сохраняются в settings.ini (в каталоге запуска)
  * - Автозапуск через реестр (HKLM\...\Run) с запросом повышения прав только по нажатию пунктов меню
+ *
+ * @note
+ * Автозапуск реализован в Autorun.h (перенесена “рабочая” версия из main.cpp).
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,7 +26,6 @@
 #include <commctrl.h>
 
 #include <string>
-#include <cwctype>
 #include <cwchar>
 #include <cmath>
 #include <cstring>
@@ -28,216 +34,66 @@
 #include "SettingsWindow.h"
 #include "TrayIcon.h"
 #include "HotkeyCalc.h"
+#include "Autorun.h"
 
-static constexpr UINT  kTrayCallbackMsg = WM_APP + 1;
+/**
+ * Callback-сообщение от трея (WM_APP+N).
+ */
+#define TRAY_CALLBACK_MSG      (WM_APP + 1)
 
 // IDs меню
-static constexpr UINT  kMenuSettings      = 1002;
-static constexpr UINT  kMenuAutorunEnable = 1003;
-static constexpr UINT  kMenuAutorunDisable = 1004;
-static constexpr UINT  kMenuExit          = 1001;
+#define MENU_EXIT              1001
+#define MENU_SETTINGS          1002
+#define MENU_AUTORUN_ENABLE    1003
+#define MENU_AUTORUN_DISABLE   1004
 
 // ID иконки из ресурсов (main.rc: `1 ICON ...`)
-static constexpr int   kAppIconId    = 1;
+#define APP_ICON_ID            1
 
-// Коэффициенты по умолчанию (потом подхватятся из ini)
-static double gCoeffs[3] = { 1.6, 1.75, 2.0 };
+/**
+ * Коэффициенты категорий по умолчанию (потом подхватятся из ini).
+ */
+static double gCoeffs[3] = { 1.75, 1.6, 2.0 };
 
 static HICON gIconBig   = nullptr;
 static HICON gIconSmall = nullptr;
 
+/**
+ * Зарегистрированное сообщение "TaskbarCreated" (для восстановления иконки после рестарта Explorer).
+ */
 static UINT  gTaskbarCreatedMsg = 0;
 
+/**
+ * HWND скрытого главного окна (нужен, в т.ч. для корректного Stop/WM_CLOSE).
+ */
 static HWND  gMainHwnd = nullptr;
 
 //=====================================================================//
 // Autorun (HKLM\Software\Microsoft\Windows\CurrentVersion\Run)
+// Перенесено в Autorun.h (рабочая версия, используемая меню трея).
 //=====================================================================//
-
-static const wchar_t *kAutorunRegPath  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const wchar_t *kAutorunValueName = L"TrayHotkeyCalc";
-
-static std::wstring GetExePath()
-{
-	wchar_t buf[4096] = {};
-	const DWORD got = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(_countof(buf)));
-	if (got == 0 || got >= _countof(buf)) {
-		return L"";
-	}
-	return std::wstring(buf);
-}
-
-static std::wstring QuotePath(const std::wstring &path)
-{
-	std::wstring out;
-	out.reserve(path.size() + 2);
-	out.push_back(L'"');
-	out += path;
-	out.push_back(L'"');
-	return out;
-}
-
-static LONG Autorun_Enable_HKLM()
-{
-	const std::wstring exe = GetExePath();
-	if (exe.empty()) return ERROR_FILE_NOT_FOUND;
-
-	const std::wstring data = QuotePath(exe);
-
-	HKEY hKey = nullptr;
-	DWORD disp = 0;
-
-	LONG st = RegCreateKeyExW(
-		HKEY_LOCAL_MACHINE,
-		kAutorunRegPath,
-		0,
-		nullptr,
-		REG_OPTION_NON_VOLATILE,
-		KEY_SET_VALUE,
-		nullptr,
-		&hKey,
-		&disp
-	);
-
-	if (st != ERROR_SUCCESS) {
-		return st;
-	}
-
-	st = RegSetValueExW(
-		hKey,
-		kAutorunValueName,
-		0,
-		REG_SZ,
-		reinterpret_cast<const BYTE *>(data.c_str()),
-		static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t))
-	);
-
-	RegCloseKey(hKey);
-	return st;
-}
-
-static LONG Autorun_Disable_HKLM()
-{
-	HKEY hKey = nullptr;
-
-	LONG st = RegOpenKeyExW(
-		HKEY_LOCAL_MACHINE,
-		kAutorunRegPath,
-		0,
-		KEY_SET_VALUE,
-		&hKey
-	);
-
-	if (st == ERROR_FILE_NOT_FOUND) {
-		return ERROR_SUCCESS;
-	}
-
-	if (st != ERROR_SUCCESS) {
-		return st;
-	}
-
-	st = RegDeleteValueW(hKey, kAutorunValueName);
-	if (st == ERROR_FILE_NOT_FOUND) {
-		st = ERROR_SUCCESS;
-	}
-
-	RegCloseKey(hKey);
-	return st;
-}
-
-static bool Autorun_RunElevatedAndWait(bool enable)
-{
-	const std::wstring exe = GetExePath();
-	if (exe.empty()) return false;
-
-	const wchar_t *params = enable ? L"--autorun-enable" : L"--autorun-disable";
-
-	SHELLEXECUTEINFOW sei = {};
-	sei.cbSize = sizeof(sei);
-	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-	sei.hwnd = nullptr;
-	sei.lpVerb = L"runas";
-	sei.lpFile = exe.c_str();
-	sei.lpParameters = params;
-	sei.nShow = SW_SHOWNORMAL;
-
-	if (!ShellExecuteExW(&sei) || !sei.hProcess) {
-		return false;
-	}
-
-	WaitForSingleObject(sei.hProcess, INFINITE);
-
-	DWORD exitCode = 1;
-	GetExitCodeProcess(sei.hProcess, &exitCode);
-
-	CloseHandle(sei.hProcess);
-	return exitCode == 0;
-}
-
-static bool Autorun_TryEnableWithElevationIfNeeded()
-{
-	const LONG st = Autorun_Enable_HKLM();
-	if (st == ERROR_SUCCESS) return true;
-
-	if (st == ERROR_ACCESS_DENIED) {
-		return Autorun_RunElevatedAndWait(true);
-	}
-
-	return false;
-}
-
-static bool Autorun_TryDisableWithElevationIfNeeded()
-{
-	const LONG st = Autorun_Disable_HKLM();
-	if (st == ERROR_SUCCESS) return true;
-
-	if (st == ERROR_ACCESS_DENIED) {
-		return Autorun_RunElevatedAndWait(false);
-	}
-
-	return false;
-}
-
-static int Autorun_TryHandleCommandLine()
-{
-	int argc = 0;
-	LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-	if (!argv) {
-		return -1;
-	}
-
-	bool doEnable = false;
-	bool doDisable = false;
-
-	for (int i = 1; i < argc; i++)
-	{
-		if (wcscmp(argv[i], L"--autorun-enable") == 0) {
-			doEnable = true;
-		}
-		else if (wcscmp(argv[i], L"--autorun-disable") == 0) {
-			doDisable = true;
-		}
-	}
-
-	LocalFree(argv);
-
-	if (!doEnable && !doDisable) {
-		return -1;
-	}
-
-	const LONG st = doEnable ? Autorun_Enable_HKLM() : Autorun_Disable_HKLM();
-	return (st == ERROR_SUCCESS) ? 0 : 1;
-}
 
 //=====================================================================//
 // Single instance (без семафора, чтобы не “залипало” после TerminateProcess)
 //=====================================================================//
 
+/**
+ * Мьютекс single-instance.
+ */
 static HANDLE gSingleInstanceMutex = nullptr;
 
+/**
+ * Гарантирует запуск только одного экземпляра приложения.
+ *
+ * @details
+ * Использует CreateMutexW + проверку GetLastError()==ERROR_ALREADY_EXISTS.
+ * Специально без семафора, чтобы не “залипало” после TerminateProcess.
+ *
+ * @return true если можно продолжать запуск, false если экземпляр уже существует.
+ */
 static bool EnsureSingleInstance()
 {
-	gSingleInstanceMutex = CreateMutexW(nullptr, TRUE, L"TrayHotkeyCalc_SingleInstance_Mutex");
+	gSingleInstanceMutex = CreateMutexW(nullptr, TRUE, L"PriceCalc_SingleInstance_Mutex");
 	if (!gSingleInstanceMutex) return true;
 
 	if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -249,6 +105,9 @@ static bool EnsureSingleInstance()
 	return true;
 }
 
+/**
+ * Освобождает ресурсы single-instance (закрывает мьютекс).
+ */
 static void ReleaseSingleInstance()
 {
 	if (gSingleInstanceMutex) {
@@ -261,74 +120,106 @@ static void ReleaseSingleInstance()
 // Debug stop helper (CLion Stop)
 //=====================================================================//
 
+/**
+ * Обработчик консольных Ctrl-событий (для более мягкого Stop в IDE).
+ *
+ * @details
+ * Если главное окно уже создано — шлём WM_CLOSE, чтобы корректно удалить иконку трея.
+ *
+ * @param type Тип события консоли (CTRL_*).
+ * @return TRUE если событие обработано, иначе FALSE.
+ */
 static BOOL WINAPI ConsoleCtrlHandler(DWORD type)
 {
-    switch (type)
-    {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-        case CTRL_SHUTDOWN_EVENT:
-        case CTRL_LOGOFF_EVENT:
-        {
-            if (gMainHwnd)
-            {
-                PostMessageW(gMainHwnd, WM_CLOSE, 0, 0);
-                return TRUE;
-            }
+	switch (type)
+	{
+		case CTRL_C_EVENT:
+		case CTRL_BREAK_EVENT:
+		case CTRL_CLOSE_EVENT:
+		case CTRL_SHUTDOWN_EVENT:
+		case CTRL_LOGOFF_EVENT:
+		{
+			if (gMainHwnd)
+			{
+				PostMessageW(gMainHwnd, WM_CLOSE, 0, 0);
+				return TRUE;
+			}
 
-            // Если окна ещё нет (очень ранний Stop) — просто скажем “обработали”.
-            // Дальше CLion обычно добьёт процесс сам, но главное — не зависать.
-            return TRUE;
-        }
-        default: /* nothing */;
-    }
+			// Если окна ещё нет (очень ранний Stop) — просто скажем “обработали”.
+			// Дальше CLion обычно добьёт процесс сам, но главное — не зависать.
+			return TRUE;
+		}
+		default: /* nothing */;
+	}
 
-    return FALSE;
+	return FALSE;
 }
 
+/**
+ * Ставит ConsoleCtrlHandler, если у процесса есть консоль.
+ *
+ * @details
+ * Важно: НЕ AllocConsole(), иначе CLion Stop часто не попадает в наш процесс.
+ * 1) Если консоль уже есть — просто ставим handler.
+ * 2) Если нет — пробуем AttachConsole к родителю (если запуск был из консоли/IDE-терминала).
+ * 3) Если не получилось — просто ничего (в GUI-режиме Ctrl-событий всё равно не будет).
+ */
 static void SetupDebugStopHelper()
 {
-    // Важно: НЕ AllocConsole(), иначе CLion Stop часто не попадает в наш процесс.
-    // 1) Если консоль уже есть — просто ставим handler.
-    // 2) Если нет — пробуем AttachConsole к родителю (если запуск был из консоли/IDE-терминала).
-    // 3) Если не получилось — просто ничего (в GUI-режиме Ctrl-событий всё равно не будет).
+	bool hasConsole = (GetConsoleWindow() != nullptr);
 
-    bool hasConsole = (GetConsoleWindow() != nullptr);
+	if (!hasConsole)
+	{
+		if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+			hasConsole = true;
+		} else {
+			// ERROR_ACCESS_DENIED бывает, если консоль уже есть (AttachConsole не нужен).
+			if (GetLastError() == ERROR_ACCESS_DENIED) {
+				hasConsole = true;
+			}
+		}
+	}
 
-    if (!hasConsole)
-    {
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            hasConsole = true;
-        } else {
-            // ERROR_ACCESS_DENIED бывает, если консоль уже есть (AttachConsole не нужен).
-            if (GetLastError() == ERROR_ACCESS_DENIED) {
-                hasConsole = true;
-            }
-        }
-    }
-
-    if (hasConsole) {
-        SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
-    }
+	if (hasConsole) {
+		SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
+	}
 }
 
 //=====================================================================//
 // Icons
 //=====================================================================//
 
+/**
+ * Загружает иконку приложения заданного размера из ресурсов.
+ *
+ * @details
+ * Используется LoadImageW с LR_SHARED (DestroyIcon не нужен).
+ *
+ * @param hInst HINSTANCE модуля.
+ * @param cx    Ширина.
+ * @param cy    Высота.
+ * @return HICON или nullptr при ошибке.
+ */
 static HICON LoadAppIcon(HINSTANCE hInst, int cx, int cy)
 {
 	// LR_SHARED => DestroyIcon не нужен
 	return static_cast<HICON>(LoadImageW(
 		hInst,
-		MAKEINTRESOURCEW(kAppIconId),
+		MAKEINTRESOURCEW(APP_ICON_ID),
 		IMAGE_ICON,
 		cx, cy,
 		LR_DEFAULTCOLOR | LR_SHARED
 	));
 }
 
+/**
+ * Загружает большую/малую иконки приложения (SM_CXICON/SM_CXSMICON).
+ *
+ * @details
+ * Если из ресурсов не получилось — fallback на IDI_APPLICATION.
+ *
+ * @param hInst HINSTANCE модуля.
+ */
 static void LoadAppIcons(HINSTANCE hInst)
 {
 	const int cxBig   = GetSystemMetrics(SM_CXICON);
@@ -352,6 +243,11 @@ static void LoadAppIcons(HINSTANCE hInst)
 // INI helpers (settings.ini в каталоге запуска)
 //=====================================================================//
 
+/**
+ * Строит путь к settings.ini в текущем каталоге запуска.
+ *
+ * @return Полный путь к ini.
+ */
 static std::wstring BuildIniPath()
 {
 	DWORD need = GetCurrentDirectoryW(0, nullptr);
@@ -381,6 +277,12 @@ static std::wstring BuildIniPath()
 	return dir;
 }
 
+/**
+ * Проверяет, существует ли ini-файл и не является ли он каталогом.
+ *
+ * @param path Полный путь.
+ * @return true если файл существует и это файл, иначе false.
+ */
 static bool IniFileExists(const std::wstring &path)
 {
 	const DWORD a = GetFileAttributesW(path.c_str());
@@ -395,6 +297,13 @@ static bool IniFileExists(const std::wstring &path)
 	return true;
 }
 
+/**
+ * Быстрый парсинг double из текста (wcstod), без “жёсткой” проверки хвоста.
+ *
+ * @param s Входная строка.
+ * @param v [out] Значение.
+ * @return true если удалось распарсить, иначе false.
+ */
 static bool TryParseDoubleText(const std::wstring &s, double &v)
 {
 	v = 0.0;
@@ -409,6 +318,9 @@ static bool TryParseDoubleText(const std::wstring &s, double &v)
 	return true;
 }
 
+/**
+ * Сохраняет коэффициенты в settings.ini (секция [Coeffs], ключи Cat1..Cat3).
+ */
 static void SaveSettings()
 {
 	const std::wstring ini = BuildIniPath();
@@ -425,6 +337,12 @@ static void SaveSettings()
 	}
 }
 
+/**
+ * Загружает коэффициенты из settings.ini.
+ *
+ * @details
+ * Если ini отсутствует — создаёт его при старте с текущими значениями gCoeffs[].
+ */
 static void LoadSettings()
 {
 	const std::wstring ini = BuildIniPath();
@@ -457,11 +375,26 @@ static void LoadSettings()
 // Main window
 //=====================================================================//
 
+/**
+ * Открывает окно настроек (SettingsWindow).
+ *
+ * @param hwnd Окно-владелец (скрытое окно приложения).
+ * @param hInst HINSTANCE.
+ */
 static void OpenSettings(HWND hwnd, HINSTANCE hInst) {
 	// SaveSettings вызывается из SettingsWindow при нажатии OK, т.е. изменения пишутся в ini сразу.
 	SettingsWindow_Show(hInst, hwnd, gIconBig, gIconSmall, gCoeffs, &SaveSettings);
 }
 
+/**
+ * Финальная уборка перед выходом:
+ * - закрыть окно настроек (если висит);
+ * - убрать иконку из трея;
+ * - освободить single-instance.
+ *
+ * @param hwnd Окно приложения (сейчас не используется).
+ * @param tray Состояние трея.
+ */
 static void CleanupBeforeExit(HWND hwnd, TrayIcon &tray)
 {
 	(void) hwnd;
@@ -475,6 +408,23 @@ static void CleanupBeforeExit(HWND hwnd, TrayIcon &tray)
 	ReleaseSingleInstance();
 }
 
+/**
+ * Главный WndProc скрытого окна.
+ *
+ * @details
+ * Обрабатывает:
+ * - WM_CREATE: init иконок, ini, таймера hotkey, трея;
+ * - WM_TIMER: опрос хоткеев и выполнение HotkeyCalc;
+ * - WM_COMMAND: меню трея (Настройки, Автозапуск, Выход);
+ * - TRAY_CALLBACK_MSG: события трея (dblclick/menu);
+ * - WM_ENDSESSION/WM_DESTROY: корректная остановка.
+ *
+ * @param hwnd Окно.
+ * @param msg  Сообщение.
+ * @param wParam WPARAM.
+ * @param lParam LPARAM.
+ * @return LRESULT.
+ */
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	static TrayIcon tray = {};
@@ -501,40 +451,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			HotkeyCalc_Init(hotkey);
 			HotkeyCalc_Start(hwnd);
 
-			TrayIcon_Init(tray, hwnd, kTrayCallbackMsg, gIconSmall,
-				L"TrayHotkeyCalc (Ctrl+1/2/3)",
-				kMenuSettings,
-				kMenuAutorunEnable, kMenuAutorunDisable,
-				kMenuExit);
+			TrayIcon_Init(tray, hwnd, TRAY_CALLBACK_MSG, gIconSmall,
+				L"PriceCalc (Ctrl+1/2/3)",
+				MENU_SETTINGS,
+				MENU_AUTORUN_ENABLE, MENU_AUTORUN_DISABLE,
+				MENU_EXIT
+			);
 
 			TrayIcon_Add(tray);
 
 			return 0;
 		}
 
-		case WM_TIMER:
-		{
-			if (HotkeyCalc_OnTimer(hotkey, tray, wParam, gCoeffs)) {
-				return 0;
-			}
-			break;
+		case WM_TIMER: {
+			HotkeyCalc_OnTimer(hotkey, tray, wParam, gCoeffs);
+			return 0;
 		}
 
 		case WM_COMMAND:
 		{
 			const UINT id = LOWORD(wParam);
 
-			if (id == kMenuExit) {
+			if (id == MENU_EXIT) {
 				DestroyWindow(hwnd);
 				return 0;
 			}
 
-			if (id == kMenuSettings) {
+			if (id == MENU_SETTINGS) {
 				OpenSettings(hwnd, hInst);
 				return 0;
 			}
 
-			if (id == kMenuAutorunEnable)
+			if (id == MENU_AUTORUN_ENABLE)
 			{
 				if (Autorun_TryEnableWithElevationIfNeeded()) {
 					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Включено.");
@@ -544,7 +492,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 				return 0;
 			}
 
-			if (id == kMenuAutorunDisable)
+			if (id == MENU_AUTORUN_DISABLE)
 			{
 				if (Autorun_TryDisableWithElevationIfNeeded()) {
 					TrayIcon_ShowBalloon(tray, L"Автозапуск", L"Отключено.");
@@ -557,7 +505,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 			break;
 		}
 
-		case kTrayCallbackMsg:
+		case TRAY_CALLBACK_MSG:
 		{
 			const TrayAction a = TrayIcon_HandleCallback(tray, wParam, lParam);
 
@@ -615,6 +563,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 	return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/**
+ * Точка входа Unicode (GUI, без консоли).
+ *
+ * @details
+ * 1) Если это elevated-запуск для автозапуска — выполняем Autorun_TryHandleCommandLine() и выходим.
+ * 2) Single instance.
+ * 3) Common controls init.
+ * 4) Регистрируем класс и создаём скрытое окно для message loop / tray.
+ *
+ * @param hInstance HINSTANCE.
+ * @return Код завершения процесса.
+ */
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
 	const int autorunRc = Autorun_TryHandleCommandLine();
@@ -634,7 +594,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
 	gTaskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
-	const wchar_t *clsName = L"TrayHotkeyCalcHiddenWindow";
+	const wchar_t *clsName = L"PriceCalcHiddenWindow";
 
 	WNDCLASSEXW wc = {};
 	wc.cbSize = sizeof(wc);
@@ -655,7 +615,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	// Скрытое окно нужно для message loop / tray callbacks
 	HWND hwnd = CreateWindowExW(
 		0, clsName,
-		L"TrayHotkeyCalc",
+		L"PriceCalc",
 		WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, 300, 200,
 		nullptr, nullptr, hInstance, nullptr

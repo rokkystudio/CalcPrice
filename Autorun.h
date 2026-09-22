@@ -1,19 +1,21 @@
-// ReSharper disable CppTooWideScopeInitStatement
+// Autorun.h
+// ReSharper disable CppParameterMayBeConst
 // ReSharper disable CppLocalVariableMayBeConst
+// ReSharper disable CppParameterMayBeConstPtrOrRef
+// ReSharper disable CppTooWideScopeInitStatement
 
 #pragma once
 
 /**
  * @file Autorun.h
- * Автозапуск через реестр Windows (HKLM\...\Run).
+ * Автозапуск через реестр HKLM\Software\Microsoft\Windows\CurrentVersion\Run.
  *
  * @details
- * Пытаемся включить/отключить “по-тихому” (если процесс уже elevated).
- * Если прав не хватает — создаём временный .reg в %TEMP% и импортируем его через regedit.exe с UAC (runas).
- *
- * Дополнительно:
- * - После операции можно (и нужно) подтвердить результат чтением реестра, чтобы сообщить пользователю “успешно”.
- *   Для этого есть функции Autorun_TryEnableHKLM_WithStatus() / Autorun_TryDisableHKLM_WithStatus().
+ * Реализация перенесена из main.cpp (рабочая версия, проверенная через меню трея):
+ * - Включение/отключение пишется в HKLM\...\Run.
+ * - Если прав не хватает — запускаем текущий exe с UAC (runas) и параметрами:
+ *   --autorun-enable / --autorun-disable
+ * - В elevated-процессе операция выполняется “по-тихому” и процесс завершается.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -23,419 +25,246 @@
 #include <string>
 #include <cwchar>
 
-#include "HotkeyCalc.h"
+//=====================================================================//
+// Autorun (HKLM\Software\Microsoft\Windows\CurrentVersion\Run)
+//=====================================================================//
 
-#define AUTORUN_RUN_KEY_W          L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
-#define AUTORUN_TEMP_ENABLE_W      L"TrayHotkeyCalc-autorun-enable.reg"
-#define AUTORUN_TEMP_DISABLE_W     L"TrayHotkeyCalc-autorun-disable.reg"
+/**
+ * Путь к ветке Run (относительно HKLM).
+ */
+static const wchar_t *kAutorunRegPath   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+/**
+ * Имя значения (REG_SZ) в Run-ветке.
+ */
+static const wchar_t *kAutorunValueName = L"PriceCalc";
 
 /**
  * Возвращает полный путь к текущему exe (GetModuleFileNameW(nullptr, ...)).
+ *
  * @return Путь к exe или пустая строка при ошибке.
  */
-static std::wstring Autorun_GetExePath()
+static std::wstring GetExePath()
 {
 	wchar_t buf[4096] = {};
-	const DWORD n = GetModuleFileNameW(nullptr, buf, _countof(buf));
-	if (n == 0 || n >= _countof(buf)) {
+	const DWORD got = GetModuleFileNameW(nullptr, buf, _countof(buf));
+	if (got == 0 || got >= _countof(buf)) {
 		return L"";
 	}
-
 	return std::wstring(buf);
 }
 
 /**
- * Экранирует строку для использования внутри .reg файла:
- * - '\' -> '\\'
- * - '"' -> '\"'
- * @param s Входная строка.
- * @return Экранированная строка.
+ * Оборачивает путь в двойные кавычки.
+ *
+ * @param path Путь к файлу.
+ * @return Строка вида "C:\...\app.exe".
  */
-static std::wstring Autorun_EscapeRegString(const std::wstring &s)
+static std::wstring QuotePath(const std::wstring &path)
 {
 	std::wstring out;
-	out.reserve(s.size() * 2);
-
-	for (wchar_t c : s)
-	{
-		if (c == L'\\') {
-			out.push_back(L'\\');
-			out.push_back(L'\\');
-			continue;
-		}
-
-		if (c == L'"') {
-			out.push_back(L'\\');
-			out.push_back(L'"');
-			continue;
-		}
-
-		out.push_back(c);
-	}
-
+	out.reserve(path.size() + 2);
+	out.push_back(L'"');
+	out += path;
+	out.push_back(L'"');
 	return out;
 }
 
 /**
- * Записывает файл в UTF-16 LE с BOM (0xFEFF).
- * @param path Полный путь к файлу.
- * @param content Содержимое (wide string).
- * @return true если файл записан, иначе false.
+ * Включает автозапуск, записывая значение в HKLM\...\Run.
+ *
+ * @details
+ * Пишется строка REG_SZ: "full_path_to_exe".
+ *
+ * @return Код ошибки WinAPI (ERROR_SUCCESS при успехе).
  */
-static bool Autorun_WriteUtf16File(const std::wstring &path, const std::wstring &content)
+static LONG Autorun_Enable_HKLM()
 {
-	HANDLE h = CreateFileW(
-		path.c_str(),
-		GENERIC_WRITE,
-		FILE_SHARE_READ,
+	const std::wstring exe = GetExePath();
+	if (exe.empty()) return ERROR_FILE_NOT_FOUND;
+
+	const std::wstring data = QuotePath(exe);
+
+	HKEY hKey = nullptr;
+	DWORD disp = 0;
+
+	LONG st = RegCreateKeyExW(
+		HKEY_LOCAL_MACHINE,
+		kAutorunRegPath,
+		0,
 		nullptr,
-		CREATE_ALWAYS,
-		FILE_ATTRIBUTE_NORMAL,
-		nullptr
+		REG_OPTION_NON_VOLATILE,
+		KEY_SET_VALUE,
+		nullptr,
+		&hKey,
+		&disp
 	);
 
-	if (h == INVALID_HANDLE_VALUE) return false;
-
-	// UTF-16 LE BOM
-    constexpr WORD bom = 0xFEFF;
-	DWORD wrote = 0;
-
-	if (!WriteFile(h, &bom, sizeof(bom), &wrote, nullptr)) {
-		CloseHandle(h);
-		return false;
+	if (st != ERROR_SUCCESS) {
+		return st;
 	}
 
-	const DWORD bytes = content.size() * sizeof(wchar_t);
-	if (!WriteFile(h, content.c_str(), bytes, &wrote, nullptr)) {
-		CloseHandle(h);
-		return false;
-	}
+	st = RegSetValueExW(
+		hKey,
+		kAutorunValueName,
+		0,
+		REG_SZ,
+		reinterpret_cast<const BYTE *>(data.c_str()),
+		static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t))
+	);
 
-	CloseHandle(h);
-	return true;
+	RegCloseKey(hKey);
+	return st;
 }
 
 /**
- * Строит путь во временную папку (%TEMP%).
- * @param fileName Имя файла (без пути).
- * @return Полный путь.
+ * Отключает автозапуск, удаляя значение из HKLM\...\Run.
+ *
+ * @details
+ * Если значение отсутствует — возвращает ERROR_SUCCESS.
+ *
+ * @return Код ошибки WinAPI (ERROR_SUCCESS при успехе).
  */
-static std::wstring Autorun_BuildTempPath(const wchar_t *fileName)
+static LONG Autorun_Disable_HKLM()
 {
-	wchar_t dir[MAX_PATH] = {};
-	const DWORD n = GetTempPathW(_countof(dir), dir);
-	if (n == 0 || n >= _countof(dir)) {
-		return std::wstring(fileName);
+	HKEY hKey = nullptr;
+
+	LONG st = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE,
+		kAutorunRegPath,
+		0,
+		KEY_SET_VALUE,
+		&hKey
+	);
+
+	if (st == ERROR_FILE_NOT_FOUND) {
+		return ERROR_SUCCESS;
 	}
 
-	std::wstring out = dir;
-	out += fileName;
-	return out;
+	if (st != ERROR_SUCCESS) {
+		return st;
+	}
+
+	st = RegDeleteValueW(hKey, kAutorunValueName);
+	if (st == ERROR_FILE_NOT_FOUND) {
+		st = ERROR_SUCCESS;
+	}
+
+	RegCloseKey(hKey);
+	return st;
 }
 
 /**
- * Запускает regedit.exe /s "<regFile>" с повышением прав (runas) и ждёт завершения.
- * @param regFile Путь к .reg файлу.
- * @param exitCode [out] Код завершения процесса (или GetLastError() если ShellExecuteExW не запустился).
- * @return true если процесс стартовал и завершился с exitCode==0 (или если процесс стартовал без hProcess).
+ * Запускает текущий exe с повышением прав (UAC) и ждёт завершения.
+ *
+ * @param enable true => "--autorun-enable", false => "--autorun-disable".
+ * @return true если elevated-процесс завершился с exit code 0, иначе false.
  */
-static bool Autorun_RunRegeditElevated(const std::wstring &regFile, DWORD &exitCode)
+static bool Autorun_RunElevatedAndWait(bool enable)
 {
-	exitCode = 0;
+	const std::wstring exe = GetExePath();
+	if (exe.empty()) return false;
 
-	std::wstring params = L"/s \"";
-	params += regFile;
-	params += L"\"";
+	const wchar_t *params = enable ? L"--autorun-enable" : L"--autorun-disable";
 
 	SHELLEXECUTEINFOW sei = {};
 	sei.cbSize = sizeof(sei);
 	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+	sei.hwnd = nullptr;
 	sei.lpVerb = L"runas";
-	sei.lpFile = L"regedit.exe";
-	sei.lpParameters = params.c_str();
-	sei.nShow = SW_HIDE;
+	sei.lpFile = exe.c_str();
+	sei.lpParameters = params;
+	sei.nShow = SW_SHOWNORMAL;
 
-	if (!ShellExecuteExW(&sei)) {
-		exitCode = GetLastError();
+	if (!ShellExecuteExW(&sei) || !sei.hProcess) {
 		return false;
 	}
 
-	// Запустилось, но хэндла нет — считаем “ок”
-	if (!sei.hProcess) return true;
-
 	WaitForSingleObject(sei.hProcess, INFINITE);
 
-	DWORD code = 0;
-	if (GetExitCodeProcess(sei.hProcess, &code)) {
-		exitCode = code;
-	}
+	DWORD exitCode = 1;
+	GetExitCodeProcess(sei.hProcess, &exitCode);
 
 	CloseHandle(sei.hProcess);
 	return exitCode == 0;
 }
 
 /**
- * Проверяет наличие параметра автозапуска в HKLM\...\Run.
- * @param valueName Имя значения (например, "TrayHotkeyCalc").
- * @return true если значение существует и оно REG_SZ/REG_EXPAND_SZ.
- */
-static bool Autorun_IsEnabledHKLM(const wchar_t *valueName)
-{
-	if (!valueName || !*valueName) return false;
-
-	HKEY hKey = nullptr;
-	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, AUTORUN_RUN_KEY_W,
-		0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) {
-		return false;
-	}
-
-	DWORD type = 0;
-	wchar_t buf[4096] = {};
-	DWORD cb = sizeof(buf);
-
-	const LONG r = RegQueryValueExW(hKey, valueName, nullptr,
-		&type, reinterpret_cast<BYTE *>(buf), &cb);
-	RegCloseKey(hKey);
-
-	if (r != ERROR_SUCCESS) return false;
-	if (type != REG_SZ && type != REG_EXPAND_SZ) return false;
-
-	return true;
-}
-
-/**
- * Включает автозапуск в HKLM\...\Run.
+ * Пытается включить автозапуск:
+ * - если прав хватает — пишет HKLM напрямую;
+ * - если ERROR_ACCESS_DENIED — запускает elevated-процесс.
  *
- * @details
- * 1) Пробуем записать ключ напрямую (если уже elevated).
- * 2) Если ERROR_ACCESS_DENIED — создаём .reg во временной папке и импортируем через regedit.exe (runas).
- *
- * @param valueName Имя значения (например, "TrayHotkeyCalc").
- * @param err [out] Текст ошибки (если false).
- * @return true если операция выполнена, иначе false.
+ * @return true если автозапуск включён, иначе false.
  */
-static bool Autorun_EnableHKLM(const wchar_t *valueName, std::wstring &err)
+static bool Autorun_TryEnableWithElevationIfNeeded()
 {
-	err.clear();
+	const LONG st = Autorun_Enable_HKLM();
+	if (st == ERROR_SUCCESS) return true;
 
-	if (!valueName || !*valueName) {
-		err = L"Некорректное имя параметра автозапуска.";
-		return false;
+	if (st == ERROR_ACCESS_DENIED) {
+		return Autorun_RunElevatedAndWait(true);
 	}
 
-	const std::wstring exePath = Autorun_GetExePath();
-	if (exePath.empty()) {
-		err = L"Не удалось получить путь к exe.";
-		return false;
-	}
-
-	const std::wstring cmd = L"\"" + exePath + L"\"";
-
-	// 1) Попытка без UAC (если уже elevated)
-	HKEY hKey = nullptr;
-	LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, AUTORUN_RUN_KEY_W, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr);
-	if (r == ERROR_SUCCESS)
-	{
-		r = RegSetValueExW(hKey, valueName, 0, REG_SZ,
-			reinterpret_cast<const BYTE *>(cmd.c_str()),
-			(cmd.size() + 1) * sizeof(wchar_t));
-
-		RegCloseKey(hKey);
-
-		if (r == ERROR_SUCCESS) {
-			return true;
-		}
-	}
-
-	// 2) Если не хватило прав — делаем через regedit.exe (runas) по клику
-	if (r == ERROR_ACCESS_DENIED)
-	{
-		const std::wstring regPath = Autorun_BuildTempPath(AUTORUN_TEMP_ENABLE_W);
-
-		const std::wstring escPath = Autorun_EscapeRegString(exePath);
-
-		std::wstring reg;
-		reg += L"Windows Registry Editor Version 5.00\r\n\r\n";
-		reg += L"[HKEY_LOCAL_MACHINE\\";
-		reg += AUTORUN_RUN_KEY_W;
-		reg += L"]\r\n\"";
-		reg += valueName;
-		reg += L"\"=\"\\\"";
-		reg += escPath;
-		reg += L"\\\"\"\r\n";
-
-		if (!Autorun_WriteUtf16File(regPath, reg)) {
-			err = L"Не удалось создать .reg файл во временной папке.";
-			return false;
-		}
-
-		DWORD exitCode = 0;
-		const bool ok = Autorun_RunRegeditElevated(regPath, exitCode);
-
-		// Пытаемся прибраться (даже если не вышло)
-		DeleteFileW(regPath.c_str());
-
-		if (!ok)
-		{
-			if (exitCode == ERROR_CANCELLED) {
-				err = L"Отменено пользователем (UAC).";
-				return false;
-			}
-
-			err = L"Не удалось включить автозапуск (regedit).";
-			return false;
-		}
-
-		return true;
-	}
-
-	err = L"Не удалось включить автозапуск (ошибка реестра).";
 	return false;
 }
 
 /**
- * Отключает автозапуск в HKLM\...\Run.
+ * Пытается отключить автозапуск:
+ * - если прав хватает — удаляет HKLM напрямую;
+ * - если ERROR_ACCESS_DENIED — запускает elevated-процесс.
  *
- * @details
- * 1) Пробуем удалить значение напрямую (если уже elevated).
- * 2) Если ERROR_ACCESS_DENIED — создаём .reg во временной папке и импортируем через regedit.exe (runas).
- *
- * @param valueName Имя значения (например, "TrayHotkeyCalc").
- * @param err [out] Текст ошибки (если false).
- * @return true если операция выполнена, иначе false.
+ * @return true если автозапуск отключён, иначе false.
  */
-static bool Autorun_DisableHKLM(const wchar_t *valueName, std::wstring &err)
+static bool Autorun_TryDisableWithElevationIfNeeded()
 {
-	err.clear();
+	const LONG st = Autorun_Disable_HKLM();
+	if (st == ERROR_SUCCESS) return true;
 
-	if (!valueName || !*valueName) {
-		err = L"Некорректное имя параметра автозапуска.";
-		return false;
+	if (st == ERROR_ACCESS_DENIED) {
+		return Autorun_RunElevatedAndWait(false);
 	}
 
-	// 1) Попытка без UAC (если уже elevated)
-	HKEY hKey = nullptr;
-	LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, AUTORUN_RUN_KEY_W, 0, KEY_SET_VALUE, &hKey);
-	if (r == ERROR_SUCCESS)
-	{
-		r = RegDeleteValueW(hKey, valueName);
-		RegCloseKey(hKey);
-
-		if (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND) {
-			return true;
-		}
-	}
-
-	// 2) Если не хватило прав — делаем через regedit.exe (runas) по клику
-	if (r == ERROR_ACCESS_DENIED)
-	{
-		const std::wstring regPath = Autorun_BuildTempPath(AUTORUN_TEMP_DISABLE_W);
-
-		std::wstring reg;
-		reg += L"Windows Registry Editor Version 5.00\r\n\r\n";
-		reg += L"[HKEY_LOCAL_MACHINE\\";
-		reg += AUTORUN_RUN_KEY_W;
-		reg += L"]\r\n\"";
-		reg += valueName;
-		reg += L"\"=-\r\n";
-
-		if (!Autorun_WriteUtf16File(regPath, reg)) {
-			err = L"Не удалось создать .reg файл во временной папке.";
-			return false;
-		}
-
-		DWORD exitCode = 0;
-		const bool ok = Autorun_RunRegeditElevated(regPath, exitCode);
-
-		// Пытаемся прибраться (даже если не вышло)
-		DeleteFileW(regPath.c_str());
-
-		if (!ok)
-		{
-			if (exitCode == ERROR_CANCELLED) {
-				err = L"Отменено пользователем (UAC).";
-				return false;
-			}
-
-			err = L"Не удалось отключить автозапуск (regedit).";
-			return false;
-		}
-
-		return true;
-	}
-
-	err = L"Не удалось отключить автозапуск (ошибка реестра).";
 	return false;
 }
 
 /**
- * Включает автозапуск и формирует “человеческий” статус (для balloon/логов).
+ * Обрабатывает параметр командной строки для elevated-запуска.
  *
  * @details
- * - Если уже включено: вернёт true и status="Автозапуск уже включен."
- * - Если включили: вернёт true и status="Автозапуск включен."
- * - Если операция “вернулась ok”, но реестр не подтвердился: вернёт false и err="..."
+ * Если есть --autorun-enable/--autorun-disable:
+ * - выполняет операцию;
+ * - возвращает 0/1 (код процесса).
+ * Если параметров нет — возвращает -1 (обычный запуск приложения).
  *
- * @param valueName Имя значения (например, "TrayHotkeyCalc").
- * @param status [out] Сообщение успеха (если true).
- * @param err [out] Сообщение ошибки (если false).
- * @return true если включено и подтверждено чтением реестра.
+ * @return -1 если это обычный запуск, либо 0/1 если это autorun-команда.
  */
-static bool Autorun_TryEnableHKLM_WithStatus(const wchar_t *valueName, std::wstring &status, std::wstring &err)
+static int Autorun_TryHandleCommandLine()
 {
-	status.clear();
-	err.clear();
-
-	if (Autorun_IsEnabledHKLM(valueName)) {
-		status = L"Автозапуск уже включен.";
-		return true;
+	int argc = 0;
+	LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	if (!argv) {
+		return -1;
 	}
 
-	if (!Autorun_EnableHKLM(valueName, err)) {
-		return false;
+	bool doEnable = false;
+	bool doDisable = false;
+
+	for (int i = 1; i < argc; i++)
+	{
+		if (wcscmp(argv[i], L"--autorun-enable") == 0) {
+			doEnable = true;
+		}
+		else if (wcscmp(argv[i], L"--autorun-disable") == 0) {
+			doDisable = true;
+		}
 	}
 
-	if (!Autorun_IsEnabledHKLM(valueName)) {
-		err = L"Операция выполнена, но не удалось подтвердить включение автозапуска.";
-		return false;
+	LocalFree(argv);
+
+	if (!doEnable && !doDisable) {
+		return -1;
 	}
 
-	status = L"Автозапуск включен.";
-	return true;
-}
-
-/**
- * Отключает автозапуск и формирует “человеческий” статус (для balloon/логов).
- *
- * @details
- * - Если уже отключено: вернёт true и status="Автозапуск уже отключен."
- * - Если отключили: вернёт true и status="Автозапуск отключен."
- * - Если операция “вернулась ok”, но реестр не подтвердился: вернёт false и err="..."
- *
- * @param valueName Имя значения (например, "TrayHotkeyCalc").
- * @param status [out] Сообщение успеха (если true).
- * @param err [out] Сообщение ошибки (если false).
- * @return true если отключено и подтверждено чтением реестра.
- */
-static bool Autorun_TryDisableHKLM_WithStatus(const wchar_t *valueName, std::wstring &status, std::wstring &err)
-{
-	status.clear();
-	err.clear();
-
-	if (!Autorun_IsEnabledHKLM(valueName)) {
-		status = L"Автозапуск уже отключен.";
-		return true;
-	}
-
-	if (!Autorun_DisableHKLM(valueName, err)) {
-		return false;
-	}
-
-	if (Autorun_IsEnabledHKLM(valueName)) {
-		err = L"Операция выполнена, но не удалось подтвердить отключение автозапуска.";
-		return false;
-	}
-
-	status = L"Автозапуск отключен.";
-	return true;
+	const LONG st = doEnable ? Autorun_Enable_HKLM() : Autorun_Disable_HKLM();
+	return (st == ERROR_SUCCESS) ? 0 : 1;
 }

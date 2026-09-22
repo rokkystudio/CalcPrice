@@ -347,7 +347,7 @@ static void SettingsWindow_Show(HINSTANCE hInst, HWND owner, HICON hIconBig, HIC
 	gSettingsCoeffs = coeffs;
 	gSettingsSaveFn = saveFn;
 
-    auto clsName = L"TrayHotkeyCalcSettings";
+    auto clsName = L"CalcPriceSettings";
 
 	WNDCLASSEXW wc = {};
 	wc.cbSize = sizeof(wc);
